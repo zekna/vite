@@ -1,0 +1,406 @@
+import React, { useEffect, useState, useRef } from 'react';
+
+// GelirGiderUygulamasi - Tek dosyalık React bileşeni
+// Kullanım: Vite + React + Tailwind ile çalıştırılabilir.
+// - 'npm create vite@latest' ile bir proje oluşturup bu dosyayı src/App.jsx olarak koyun.
+// - Tailwind kurulumu yapın veya sınıfları kendi CSS'inizle değiştirin.
+// - Uygulama localStorage kullanır; bildirimler için tarayıcı bildirimi izni ister.
+
+export default function App() {
+  // Veri yapısı
+  // categories: örnek kategori, transactions: gelir/gider kalemi
+  // transaction = { id, type: 'income'|'expense', title, amount, date (ISO), recurring: {freq: 'monthly'|'yearly'|null, day: number}, notes }
+
+  const STORAGE_KEY = 'gg_app_data_v1';
+
+  const defaultState = {
+    transactions: [
+      // örnek devam eden ödeme
+      { id: genId(), type: 'expense', title: 'Kira', amount: 3500, date: todayISOWithDay(1), recurring: { freq: 'monthly', day: 1 }, notes: '' },
+      { id: genId(), type: 'expense', title: 'İnternet', amount: 200, date: todayISOWithDay(5), recurring: { freq: 'monthly', day: 5 }, notes: '' },
+      { id: genId(), type: 'income', title: 'Maaş', amount: 12000, date: todayISOWithDay(1), recurring: { freq: 'monthly', day: 1 }, notes: '' },
+    ],
+  };
+
+  const [state, setState] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) return JSON.parse(raw);
+      return defaultState;
+    } catch (e) {
+      return defaultState;
+    }
+  });
+
+  const [viewPeriod, setViewPeriod] = useState({ type: 'monthly', year: new Date().getFullYear(), month: new Date().getMonth() });
+  const [form, setForm] = useState(emptyForm());
+  const [editingId, setEditingId] = useState(null);
+  const checkTimerRef = useRef(null);
+
+  useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(state)), [state]);
+
+  useEffect(() => {
+    // Bildirim izni isteme
+    if (Notification && Notification.permission === 'default') {
+      // istemeden otomatik istemeyelim, ama uyg. ilk açılışta sorulabilir
+      // burada isteğe bağlı: kullanıcıya bildirim açmasını söyleyen küçük bir uyarı gösteriyoruz
+    }
+
+    startDueChecker();
+    return stopDueChecker;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
+  function startDueChecker() {
+    stopDueChecker();
+    // Kontrolü her 15 dakikada bir yap. (uygulama açıkken çalışır)
+    checkTimerRef.current = setInterval(() => {
+      checkDuePayments();
+    }, 1000 * 60 * 15);
+    // ilk kontrol hemen
+    checkDuePayments();
+  }
+  function stopDueChecker() {
+    if (checkTimerRef.current) {
+      clearInterval(checkTimerRef.current);
+      checkTimerRef.current = null;
+    }
+  }
+
+  function checkDuePayments() {
+    // Bugünkü ödemeleri hesapla ve bildirim gönder
+    const today = new Date();
+    const due = state.transactions.filter((t) => {
+      if (!t.recurring || !t.recurring.freq) return false;
+      if (t.recurring.freq === 'monthly') {
+        return t.recurring.day === today.getDate();
+      }
+      if (t.recurring.freq === 'yearly') {
+        const d = new Date(t.date);
+        return d.getDate() === today.getDate() && d.getMonth() === today.getMonth();
+      }
+      return false;
+    });
+
+    if (due.length === 0) return;
+
+    // Bildirim yetkisi iste ve gönder
+    if ('Notification' in window) {
+      if (Notification.permission === 'granted') {
+        due.forEach((t) => sendNotification(`Ödeme günü: ${t.title}`, `${t.type === 'expense' ? 'Ödenecek' : 'Gelecek'}: ${formatCurrency(t.amount)} - ${t.recurring.freq}`));
+      } else if (Notification.permission !== 'denied') {
+        Notification.requestPermission().then((perm) => {
+          if (perm === 'granted') {
+            due.forEach((t) => sendNotification(`Ödeme günü: ${t.title}`, `${t.type === 'expense' ? 'Ödenecek' : 'Gelecek'}: ${formatCurrency(t.amount)} - ${t.recurring.freq}`));
+          }
+        });
+      }
+    }
+  }
+
+  function sendNotification(title, body) {
+    try {
+      const n = new Notification(title, { body });
+      // tıklanınca uygulamayı öne çıkarma davranışı eklenebilir
+      n.onclick = () => window.focus();
+    } catch (e) {
+      // Tarayıcı desteklemeyebilir
+      console.warn('Bildirim gönderilemedi', e);
+    }
+  }
+
+  function addTransaction(tx) {
+    setState((s) => ({ ...s, transactions: [...s.transactions, { ...tx, id: genId() }] }));
+  }
+
+  function updateTransaction(id, changes) {
+    setState((s) => ({ ...s, transactions: s.transactions.map((t) => (t.id === id ? { ...t, ...changes } : t)) }));
+  }
+
+  function removeTransaction(id) {
+    setState((s) => ({ ...s, transactions: s.transactions.filter((t) => t.id !== id) }));
+  }
+
+  // Raporlama
+  const monthStart = new Date(viewPeriod.year, viewPeriod.month, 1);
+  const monthEnd = new Date(viewPeriod.year, viewPeriod.month + 1, 0, 23, 59, 59);
+
+  const transactionsInView = state.transactions.filter((t) => {
+    // Tekil tarihler veya tekrar edenleri de dahil et (tekrar edenler için bu ayın örneği)
+    const tDate = new Date(t.date);
+    if (t.recurring && t.recurring.freq) {
+      if (t.recurring.freq === 'monthly') {
+        // Bu ayki tarih
+        const day = Math.min(t.recurring.day, daysInMonth(viewPeriod.year, viewPeriod.month));
+        const d = new Date(viewPeriod.year, viewPeriod.month, day);
+        return d >= monthStart && d <= monthEnd;
+      }
+      if (t.recurring.freq === 'yearly') {
+        const d = new Date(viewPeriod.year, tDate.getMonth(), tDate.getDate());
+        return d >= monthStart && d <= monthEnd;
+      }
+    }
+    // Tek seferlik
+    return tDate >= monthStart && tDate <= monthEnd;
+  });
+
+  const totals = transactionsInView.reduce(
+    (acc, t) => {
+      if (t.type === 'income') acc.income += Number(t.amount);
+      else acc.expense += Number(t.amount);
+      return acc;
+    },
+    { income: 0, expense: 0 }
+  );
+
+  function onSubmitForm(e) {
+    e.preventDefault();
+    const tx = {
+      type: form.type,
+      title: form.title,
+      amount: Number(form.amount),
+      date: form.date,
+      notes: form.notes,
+      recurring: form.recurringFreq ? { freq: form.recurringFreq, day: Number(form.recurringDay) } : null,
+    };
+    if (editingId) {
+      updateTransaction(editingId, tx);
+      setEditingId(null);
+    } else {
+      addTransaction(tx);
+    }
+    setForm(emptyForm());
+  }
+
+  function startEdit(tx) {
+    setEditingId(tx.id);
+    setForm({
+      type: tx.type,
+      title: tx.title,
+      amount: tx.amount,
+      date: tx.date,
+      notes: tx.notes || '',
+      recurringFreq: tx.recurring?.freq || null,
+      recurringDay: tx.recurring?.day || new Date(tx.date).getDate(),
+    });
+  }
+
+  function exportCSV() {
+    const rows = [['Tür', 'Başlık', 'Miktar', 'Tarih', 'Tekrar', 'Notlar']];
+    state.transactions.forEach((t) => {
+      rows.push([t.type, t.title, t.amount, t.date, t.recurring ? `${t.recurring.freq}@${t.recurring.day}` : '', t.notes || '']);
+    });
+    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'gelir_gider_export.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-4 md:p-8 font-sans">
+      <div className="max-w-5xl mx-auto">
+        <header className="mb-6">
+          <h1 className="text-2xl md:text-3xl font-bold">Gelir - Gider Takip Uygulaması</h1>
+          <p className="text-sm text-gray-600">Aylık ve yıllık görünüm · Tekrarlayan ödemeler · Bildirimler</p>
+        </header>
+
+        <section className="grid md:grid-cols-3 gap-4">
+          <div className="md:col-span-2 bg-white p-4 rounded-2xl shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex gap-2 items-center">
+                <button className="px-3 py-1 rounded bg-gray-100" onClick={() => changeView(-1)}>◀</button>
+                <div>
+                  <strong>{viewPeriod.type === 'monthly' ? `${monthName(viewPeriod.month)} ${viewPeriod.year}` : viewPeriod.year}</strong>
+                </div>
+                <button className="px-3 py-1 rounded bg-gray-100" onClick={() => changeView(1)}>▶</button>
+              </div>
+
+              <div className="flex gap-2">
+                <select value={viewPeriod.type} onChange={(e) => setViewPeriod((p) => ({ ...p, type: e.target.value }))} className="px-2 py-1 rounded border">
+                  <option value="monthly">Aylık</option>
+                  <option value="yearly">Yıllık (yıl seç)</option>
+                </select>
+                <select value={viewPeriod.year} onChange={(e) => setViewPeriod((p) => ({ ...p, year: Number(e.target.value) }))} className="px-2 py-1 rounded border">
+                  {range(new Date().getFullYear() - 5, new Date().getFullYear() + 5).map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </select>
+                {viewPeriod.type === 'monthly' && (
+                  <select value={viewPeriod.month} onChange={(e) => setViewPeriod((p) => ({ ...p, month: Number(e.target.value) }))} className="px-2 py-1 rounded border">
+                    {range(0, 11).map((m) => (
+                      <option key={m} value={m}>{monthName(m)}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+
+            <div className="mb-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm text-gray-500">Toplam Gelir</div>
+                  <div className="text-xl font-semibold">{formatCurrency(totals.income)}</div>
+                </div>
+                <div>
+                  <div className="text-sm text-gray-500">Toplam Gider</div>
+                  <div className="text-xl font-semibold">{formatCurrency(totals.expense)}</div>
+                </div>
+                <div>
+                  <div className="text-sm text-gray-500">Bakiye</div>
+                  <div className={`text-xl font-semibold ${totals.income - totals.expense < 0 ? 'text-red-600' : 'text-green-600'}`}>{formatCurrency(totals.income - totals.expense)}</div>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <table className="w-full text-left table-auto">
+                <thead>
+                  <tr className="text-sm text-gray-500 border-b">
+                    <th className="py-2">Tarih</th>
+                    <th>Başlık</th>
+                    <th>Miktar</th>
+                    <th>Tekrar</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {transactionsInView.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="py-4 text-center text-gray-500">Bu döneme ait işlem bulunamadı.</td>
+                    </tr>
+                  )}
+                  {transactionsInView.map((t) => (
+                    <tr key={t.id} className="border-b hover:bg-gray-50">
+                      <td className="py-2 align-top">{formatDateForDisplay(t, viewPeriod)}</td>
+                      <td className="align-top">
+                        <div className="font-semibold">{t.title}</div>
+                        <div className="text-xs text-gray-500">{t.notes}</div>
+                      </td>
+                      <td className="align-top">{t.type === 'income' ? '+' : '-'} {formatCurrency(t.amount)}</td>
+                      <td className="align-top text-sm text-gray-600">{t.recurring ? `${t.recurring.freq} @ ${t.recurring.day}` : 'Tek seferlik'}</td>
+                      <td className="align-top">
+                        <div className="flex gap-2">
+                          <button className="px-2 py-1 rounded bg-gray-100 text-sm" onClick={() => startEdit(t)}>Düzenle</button>
+                          <button className="px-2 py-1 rounded bg-red-100 text-sm" onClick={() => removeTransaction(t.id)}>Sil</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              <button onClick={exportCSV} className="px-3 py-1 rounded bg-gray-100">CSV Dışa Aktar</button>
+              <button onClick={() => { if (confirm('Tüm verileri sıfırlamak istediğinize emin misiniz?')) { setState({ transactions: [] }); } }} className="px-3 py-1 rounded bg-red-100">Verileri Sil</button>
+            </div>
+
+          </div>
+
+          <aside className="bg-white p-4 rounded-2xl shadow-sm">
+            <h2 className="font-semibold mb-2">İşlem Ekle / Düzenle</h2>
+            <form onSubmit={onSubmitForm} className="space-y-2">
+              <div className="flex gap-2">
+                <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} className="flex-1 px-2 py-1 rounded border">
+                  <option value="expense">Gider</option>
+                  <option value="income">Gelir</option>
+                </select>
+                <input required placeholder="Başlık" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} className="flex-2 px-2 py-1 rounded border" />
+              </div>
+
+              <div className="flex gap-2">
+                <input required type="number" step="0.01" placeholder="Miktar" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} className="px-2 py-1 rounded border w-32" />
+                <input required type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="px-2 py-1 rounded border" />
+              </div>
+
+              <div>
+                <label className="text-sm">Tekrarlama</label>
+                <div className="flex gap-2 mt-1">
+                  <select value={form.recurringFreq || ''} onChange={(e) => setForm({ ...form, recurringFreq: e.target.value || null })} className="px-2 py-1 rounded border">
+                    <option value="">Tek seferlik</option>
+                    <option value="monthly">Aylık</option>
+                    <option value="yearly">Yıllık</option>
+                  </select>
+                  {form.recurringFreq && (
+                    <input type="number" min={1} max={31} value={form.recurringDay} onChange={(e) => setForm({ ...form, recurringDay: Number(e.target.value) })} className="px-2 py-1 rounded border w-24" />
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <textarea placeholder="Notlar" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full px-2 py-1 rounded border" rows={3}></textarea>
+              </div>
+
+              <div className="flex gap-2">
+                <button type="submit" className="px-3 py-1 rounded bg-blue-600 text-white">{editingId ? 'Güncelle' : 'Ekle'}</button>
+                <button type="button" onClick={() => { setForm(emptyForm()); setEditingId(null); }} className="px-3 py-1 rounded bg-gray-100">Temizle</button>
+                <button type="button" onClick={() => { if (Notification && Notification.permission !== 'granted') Notification.requestPermission(); alert('Bildirim izni istendi. Lütfen tarayıcıdan "İzin Ver"i seçin.'); }} className="px-3 py-1 rounded bg-green-100">Bildirim İzni İste</button>
+              </div>
+            </form>
+
+            <div className="mt-4 border-t pt-3 text-sm text-gray-600">
+              <strong>Kullanım notu:</strong>
+              <ul className="list-disc ml-5 mt-2">
+                <li>Uygulama verilerini tarayıcıda saklar. Tarayıcı ve cihaz değişirse verileriniz gitmezse yedeğini CSV ile alabilirsiniz.</li>
+                <li>Bildirimi almak için tarayıcıdan bildirimlere izin vermelisiniz. Mobilde PWA olarak yüklerseniz bildirimler daha stabil olabilir.</li>
+                <li>Açık olan uygulama arka planda çalışmadığı sürece kontrol periyodu uygulama açıkken çalışır — tarayıcı kapandığında tarayıcıdan bildirim gelmeyebilir (push altyapısı ayrı kurulum ister).</li>
+              </ul>
+            </div>
+          </aside>
+        </section>
+      </div>
+    </div>
+  );
+
+  // -------------------- yardımcı fonksiyonlar --------------------
+  function changeView(delta) {
+    if (viewPeriod.type === 'monthly') {
+      const d = new Date(viewPeriod.year, viewPeriod.month + delta, 1);
+      setViewPeriod({ ...viewPeriod, year: d.getFullYear(), month: d.getMonth() });
+    } else {
+      setViewPeriod({ ...viewPeriod, year: viewPeriod.year + delta });
+    }
+  }
+}
+
+// Yardımcılar dışına
+function genId() {
+  return Math.random().toString(36).slice(2, 9);
+}
+function emptyForm() {
+  return { type: 'expense', title: '', amount: '', date: new Date().toISOString().slice(0, 10), notes: '', recurringFreq: null, recurringDay: new Date().getDate() };
+}
+function formatCurrency(n) {
+  return Number(n).toLocaleString('tr-TR', { style: 'currency', currency: 'TRY' });
+}
+function todayISOWithDay(day) {
+  const d = new Date();
+  d.setDate(day);
+  return d.toISOString().slice(0, 10);
+}
+function range(a, b) {
+  const r = [];
+  for (let i = a; i <= b; i++) r.push(i);
+  return r;
+}
+function monthName(m) {
+  return ['Ocak','Şubat','Mart','Nisan','Mayıs','Haziran','Temmuz','Ağustos','Eylül','Ekim','Kasım','Aralık'][m];
+}
+function daysInMonth(y, m) {
+  return new Date(y, m + 1, 0).getDate();
+}
+function formatDateForDisplay(t, viewPeriod) {
+  if (t.recurring && t.recurring.freq) {
+    if (t.recurring.freq === 'monthly') return `${t.recurring.day} ${monthName(viewPeriod.month)}`;
+    if (t.recurring.freq === 'yearly') {
+      const d = new Date(t.date);
+      return `${d.getDate()} ${monthName(d.getMonth())}`;
+    }
+  }
+  const d = new Date(t.date);
+  return `${d.getDate()} ${monthName(d.getMonth())} ${d.getFullYear()}`;
+}
